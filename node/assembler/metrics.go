@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/hyperledger/fabric-lib-go/common/flogging"
+	"github.com/hyperledger/fabric-lib-go/common/metrics"
 	"github.com/hyperledger/fabric-x-orderer/common/deliver"
 	"github.com/hyperledger/fabric-x-orderer/common/monitoring"
 	arma_types "github.com/hyperledger/fabric-x-orderer/common/types"
@@ -21,15 +22,44 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
+var (
+	popOrWaitLatencyOpts = metrics.HistogramOpts{
+		Namespace:  "assembler",
+		Name:       "pop_or_wait_latency_seconds",
+		Help:       "The latency of PopOrWait to retrieve the requested batch.",
+		LabelNames: []string{"party_id"},
+		Buckets:    []float64{.0001, .001, .002, .003, .004, .005, .01, .03, .05, .1, .3, .5, 1}, // TODO: adjust buckets after reviewing Grafana
+	}
+
+	baToBatchLatencyOpts = metrics.HistogramOpts{
+		Namespace:  "assembler",
+		Name:       "ba_to_batch_latency_seconds",
+		Help:       "The latency from receiving a batch attestation until the matching batch is available.",
+		LabelNames: []string{"party_id"},
+		Buckets:    []float64{.0001, .001, .002, .003, .004, .005, .01, .03, .05, .1, .3, .5, 1}, // TODO: adjust buckets after reviewing Grafana
+	}
+
+	batchToLedgerLatencyOpts = metrics.HistogramOpts{
+		Namespace:  "assembler",
+		Name:       "batch_to_ledger_latency_seconds",
+		Help:       "The latency from having the matching batch available until it is appended to the ledger.",
+		LabelNames: []string{"party_id"},
+		Buckets:    []float64{.0001, .001, .002, .003, .004, .005, .01, .03, .05, .1, .3, .5, 1}, // TODO: adjust buckets after reviewing Grafana
+	}
+)
+
 type Metrics struct {
-	ledgerMetrics  *node_ledger.AssemblerLedgerMetrics
-	deliverMetrics *deliver.Metrics
-	logger         *flogging.FabricLogger
-	interval       time.Duration
-	stopChan       chan struct{}
-	stopOnce       sync.Once
-	startOnce      sync.Once
-	partyID        arma_types.PartyID
+	ledgerMetrics        *node_ledger.AssemblerLedgerMetrics
+	deliverMetrics       *deliver.Metrics
+	popOrWaitLatency     metrics.Histogram
+	baToBatchLatency     metrics.Histogram
+	batchToLedgerLatency metrics.Histogram
+	logger               *flogging.FabricLogger
+	interval             time.Duration
+	stopChan             chan struct{}
+	stopOnce             sync.Once
+	startOnce            sync.Once
+	partyID              arma_types.PartyID
 }
 
 func NewMetrics(assemblerNodeConfig *config.AssemblerNodeConfig, ledgerMetrics *node_ledger.AssemblerLedgerMetrics, logger *flogging.FabricLogger) *Metrics {
@@ -43,13 +73,20 @@ func NewMetrics(assemblerNodeConfig *config.AssemblerNodeConfig, ledgerMetrics *
 	ledgerMetrics.NewAssemblerLedgerMetrics(provider, partyID, logger)
 	deliverMetrics := deliver.NewMetrics(provider)
 
+	popOrWaitLatency := provider.NewHistogram(popOrWaitLatencyOpts).With([]string{partyID}...)
+	baToBatchLatency := provider.NewHistogram(baToBatchLatencyOpts).With([]string{partyID}...)
+	batchToLedgerLatency := provider.NewHistogram(batchToLedgerLatencyOpts).With([]string{partyID}...)
+
 	return &Metrics{
-		ledgerMetrics:  ledgerMetrics,
-		deliverMetrics: deliverMetrics,
-		interval:       assemblerNodeConfig.Metrics.MetricsLogInterval,
-		logger:         logger,
-		stopChan:       make(chan struct{}),
-		partyID:        assemblerNodeConfig.PartyId,
+		ledgerMetrics:        ledgerMetrics,
+		deliverMetrics:       deliverMetrics,
+		interval:             assemblerNodeConfig.Metrics.MetricsLogInterval,
+		logger:               logger,
+		stopChan:             make(chan struct{}),
+		partyID:              assemblerNodeConfig.PartyId,
+		popOrWaitLatency:     popOrWaitLatency,
+		baToBatchLatency:     baToBatchLatency,
+		batchToLedgerLatency: batchToLedgerLatency,
 	}
 }
 
@@ -70,7 +107,11 @@ func (m *Metrics) StopMetricsTracker() {
 		blocksCommitted := uint64(monitoring.GetMetricValue(m.ledgerMetrics.BlocksCount.(prometheus.Counter), m.logger))
 		blocksSizeCommitted := uint64(monitoring.GetMetricValue(m.ledgerMetrics.BlocksSize.(prometheus.Counter), m.logger))
 
-		m.logger.Infof("ASSEMBLER_METRICS: party_id=%d, total: TXs=%d, blocks=%d, estimated_block_size=%d", m.partyID, txCommitted, blocksCommitted, blocksSizeCommitted)
+		popOrWaitLatencyAvg := monitoring.GetHistogramAverage(m.popOrWaitLatency.(prometheus.Metric), m.logger)
+		baToBatchLatencyAvg := monitoring.GetHistogramAverage(m.baToBatchLatency.(prometheus.Metric), m.logger)
+		batchToLedgerLatencyAvg := monitoring.GetHistogramAverage(m.batchToLedgerLatency.(prometheus.Metric), m.logger)
+
+		m.logger.Infof("ASSEMBLER_METRICS: party_id=%d, total: TXs=%d, blocks=%d, estimated_block_size=%d, pop_or_wait_latency_avg=%.6f, ba_to_batch_latency_avg=%.6f, batch_to_ledger_latency_avg=%.6f", m.partyID, txCommitted, blocksCommitted, blocksSizeCommitted, popOrWaitLatencyAvg, baToBatchLatencyAvg, batchToLedgerLatencyAvg)
 	})
 }
 
@@ -98,8 +139,11 @@ func (m *Metrics) trackMetrics() {
 				newTXs = txCommitted - lastTxCommitted
 			}
 
-			m.logger.Infof("ASSEMBLER_METRICS: total: party_id=%d, TXs=%d, blocks=%d, estimated_block_size=%d, in the last %.2f seconds: TXs=%d, block=%d", m.partyID, txCommitted, blocksCommitted, blocksSizeCommitted, sec, newTXs, newBlocks)
+			popOrWaitLatencyAvg := monitoring.GetHistogramAverage(m.popOrWaitLatency.(prometheus.Metric), m.logger)
+			baToBatchLatencyAvg := monitoring.GetHistogramAverage(m.baToBatchLatency.(prometheus.Metric), m.logger)
+			batchToLedgerLatencyAvg := monitoring.GetHistogramAverage(m.batchToLedgerLatency.(prometheus.Metric), m.logger)
 
+			m.logger.Infof("ASSEMBLER_METRICS: total: party_id=%d, TXs=%d, blocks=%d, estimated_block_size=%d, pop_or_wait_latency_avg=%.6f, ba_to_batch_latency_avg=%.6f, batch_to_ledger_latency_avg=%.6f, in the last %.2f seconds: TXs=%d, blocks=%d", m.partyID, txCommitted, blocksCommitted, blocksSizeCommitted, popOrWaitLatencyAvg, baToBatchLatencyAvg, batchToLedgerLatencyAvg, sec, newTXs, newBlocks)
 			lastTxCommitted, lastBlocksCommitted = txCommitted, blocksCommitted
 		case <-m.stopChan:
 			return
