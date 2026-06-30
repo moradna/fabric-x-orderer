@@ -50,6 +50,7 @@ type Collator struct {
 	Shards                            []types.ShardID
 	runningWG                         sync.WaitGroup
 	ConfigProcessor                   ConfigProcessor
+	Metrics                           *Metrics
 }
 
 // Run starts a go routine which processes incoming ordered batch attestations from consensus
@@ -88,7 +89,7 @@ func (c *Collator) processOrderedBatchAttestations() {
 
 			continue // skip collating for BA's with config blocks
 		}
-
+		baToBatchStart := time.Now()
 		batch, err := c.collateAttestationWithBatch(oba.BatchAttestation())
 		if err != nil {
 			if errors.Is(err, utils.ErrOperationCancelled) {
@@ -97,7 +98,11 @@ func (c *Collator) processOrderedBatchAttestations() {
 			}
 			c.Logger.Panicf("Something went wrong while fetching the batch %v", oba.BatchAttestation())
 		}
+		c.Metrics.baToBatchLatency.Observe(time.Since(baToBatchStart).Seconds())
+
+		batchToLedgerStart := time.Now()
 		c.Ledger.Append(batch, oba.OrderingInformation)
+		c.Metrics.batchToLedgerLatency.Observe(time.Since(batchToLedgerStart).Seconds())
 	}
 	c.Logger.Infof("Finished processing incoming OrderedBatchAttestations from consensus")
 }
@@ -108,6 +113,9 @@ func (c *Collator) collateAttestationWithBatch(ba types.BatchAttestation) (types
 	if err != nil {
 		return nil, err
 	}
-	c.Logger.Debugf("Retrieved full batch with %d requests from index within %s, BatchID: %s", len(batch.Requests()), time.Since(t1), types.BatchIDToString(ba))
+	popOrWaitLatency := time.Since(t1)
+	c.Metrics.popOrWaitLatency.Observe(popOrWaitLatency.Seconds())
+
+	c.Logger.Debugf("Retrieved full batch with %d requests from index within %s, BatchID: %s", len(batch.Requests()), popOrWaitLatency, types.BatchIDToString(ba))
 	return batch, nil
 }

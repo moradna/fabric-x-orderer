@@ -210,6 +210,7 @@ func (a *Assembler) initFromConfig(
 		Ledger:                            a.ledger,
 		ShardCount:                        len(nodeConfig.Shards),
 		ConfigProcessor:                   a,
+		Metrics:                           a.metrics,
 	}
 
 	a.ds = NewAssemblerDeliverService(a.ledger.LedgerReader(), a.logger, nodeConfig, a.metrics.deliverMetrics)
